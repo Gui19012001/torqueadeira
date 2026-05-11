@@ -13,7 +13,7 @@ source.include_exts = py,kv,png,jpg,jpeg,json,txt,zpl
 version = 0.1.0
 
 # Dependencias Python
-requirements = python3,kivy,pyjnius,android
+requirements = python3,kivy,pyjnius
 
 # Orientacao para tablet
 orientation = landscape
