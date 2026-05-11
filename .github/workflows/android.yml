@@ -42,7 +42,9 @@ jobs:
             libncursesw5-dev \
             libssl-dev \
             libtool \
+            libtool-bin \
             libtinfo6 \
+            m4 \
             make \
             openjdk-17-jdk \
             patch \
@@ -78,3 +80,4 @@ jobs:
             bin/*.apk
             buildozer_build.log
           if-no-files-found: error
+
