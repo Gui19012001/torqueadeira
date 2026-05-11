@@ -9,7 +9,7 @@
 #   Opcional: Zebra por IP porta 9100
 #
 # Buildozer:
-#   requirements = python3,kivy,pyjnius,android
+#   requirements = python3,kivy,pyjnius
 
 import csv
 import hashlib
@@ -63,17 +63,52 @@ Window.clearcolor = (0.035, 0.045, 0.065, 1)
 # PATHS
 # =========================================================
 def base_dir() -> Path:
-    if platform == "android" and app_storage_path is not None:
-        return Path(app_storage_path())
+    # No Android não use Path.cwd() como pasta principal, porque pode apontar
+    # para área somente leitura do APK e fechar o app logo na abertura.
+    if platform == "android":
+        try:
+            if app_storage_path is not None:
+                p = app_storage_path()
+                if p:
+                    return Path(p)
+        except Exception:
+            pass
+
+        # Fallback interno usado pelo python-for-android.
+        for env_name in ("ANDROID_PRIVATE", "ANDROID_ARGUMENT"):
+            p = os.environ.get(env_name)
+            if p:
+                return Path(p)
+
+        # Último fallback. Pode exigir permissão em alguns Androids, mas evita crash
+        # se o módulo android.storage não estiver disponível.
+        return Path("/sdcard/Download/torque_pf6000")
+
     return Path.cwd()
 
 
 BASE_DIR = base_dir()
 LOG_DIR = BASE_DIR / "logs_torque_pf6000"
 CSV_DIR = BASE_DIR / "registros_torque"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-CSV_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    CSV_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    # Evita o app fechar na abertura caso alguma pasta não esteja liberada.
+    BASE_DIR = Path(os.environ.get("ANDROID_PRIVATE", ".")) if platform == "android" else Path.cwd()
+    LOG_DIR = BASE_DIR / "logs_torque_pf6000"
+    CSV_DIR = BASE_DIR / "registros_torque"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    CSV_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def salvar_crash_log(exc: BaseException):
+    try:
+        crash_file = BASE_DIR / "crash_torque_pf6000.txt"
+        import traceback
+        crash_file.write_text(traceback.format_exc(), encoding="utf-8")
+    except Exception:
+        pass
 
 # =========================================================
 # FUNCOES GERAIS
@@ -1267,4 +1302,8 @@ class TorquePF6000App(App):
 
 
 if __name__ == "__main__":
-    TorquePF6000App().run()
+    try:
+        TorquePF6000App().run()
+    except Exception as e:
+        salvar_crash_log(e)
+        raise
