@@ -7,7 +7,7 @@ source.dir = .
 source.include_exts = py,kv,png,jpg,jpeg,json,txt,env,zpl,xml
 source.exclude_dirs = .git,.github,__pycache__,bin,.buildozer,venv
 
-version = 0.1.4
+version = 0.1.6
 
 requirements = python3,kivy,pyjnius
 
