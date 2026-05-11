@@ -10,7 +10,7 @@ source.dir = .
 source.include_exts = py,kv,png,jpg,jpeg,json,txt,zpl
 
 # Versao
-version = 0.1.0
+version = 0.1.1
 
 # Dependencias Python
 requirements = python3,kivy,pyjnius
