@@ -62,22 +62,15 @@ jobs:
           python -m pip install --upgrade pip wheel
           python -m pip install setuptools cython==0.29.34 buildozer
 
-      - name: Conferir arquivos
-        run: |
-          ls -la
-          echo "---- buildozer.spec ----"
-          grep -n "requirements\|android.permissions\|android.api\|android.minapi\|android.archs\|android.add_manifest_xml" buildozer.spec || true
-
       - name: Build APK
         run: |
-          buildozer android debug 2>&1 | tee buildozer_build.log
+          buildozer android debug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: apk
-          path: |
-            bin/*.apk
-            buildozer_build.log
+          path: bin/*.apk
           if-no-files-found: error
+
 
