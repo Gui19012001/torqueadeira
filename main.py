@@ -1,12 +1,11 @@
 # main.py
-# APK Kivy - Controle de Torque PF6000 + Impressao Zebra USB/IP
+# APK Kivy - Controle de Torque PF6000 + Impressao Zebra USB
 # Projeto leve para tablet industrial.
 #
 # Fluxo:
 #   Ethernet tablet -> PF6000 169.254.1.1:4545
 #   APK captura P1..P8 via Open Protocol
 #   USB/OTG tablet -> Zebra USB com ZPL direto
-#   Opcional: Zebra por IP porta 9100
 #
 # Buildozer:
 #   requirements = python3,kivy,pyjnius
@@ -27,6 +26,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from kivy.app import App
 from kivy.clock import Clock, mainthread
 from kivy.core.window import Window
+from kivy.core.text import Label as CoreLabel
+from kivy.graphics import Color, RoundedRectangle, Line, Rectangle
+from kivy.graphics.texture import Texture
 from kivy.metrics import dp
 from kivy.properties import StringProperty, BooleanProperty, NumericProperty
 from kivy.uix.boxlayout import BoxLayout
@@ -55,7 +57,49 @@ DUPLICATE_FRAME_WINDOW_SEC = 20
 AUTO_RESET_AFTER_SEC = 3.0
 
 # Tamanho visual pensado para tablet em landscape.
-Window.clearcolor = (0.035, 0.045, 0.065, 1)
+# Paleta baseada nos últimos APKs: azul, branco e preto.
+BG_APP = (1, 1, 1, 1)
+CARD_BG = (1, 1, 1, 1)
+CARD_BORDER = (0.83, 0.88, 0.95, 1)
+HEADER_TOP = (0.03, 0.14, 0.34, 1)
+HEADER_BOTTOM = (0.10, 0.31, 0.61, 1)
+FIELD_TOP = (0.05, 0.20, 0.44, 1)
+FIELD_BOTTOM = (0.09, 0.30, 0.58, 1)
+FIELD_BORDER = (0.18, 0.41, 0.74, 1)
+BUTTON_TOP = (0.03, 0.14, 0.34, 1)
+BUTTON_BOTTOM = (0.10, 0.31, 0.61, 1)
+BUTTON_SECONDARY_TOP = (0.29, 0.35, 0.48, 1)
+BUTTON_SECONDARY_BOTTOM = (0.21, 0.26, 0.38, 1)
+TEXT_DARK = (0.09, 0.14, 0.22, 1)
+TEXT_MUTED = (0.40, 0.47, 0.58, 1)
+TEXT_LIGHT = (1, 1, 1, 1)
+SUCCESS = (0.20, 0.64, 0.33, 1)
+WARNING = (0.88, 0.58, 0.00, 1)
+ERROR = (0.82, 0.22, 0.22, 1)
+CURRENT_BLUE = (0.03, 0.14, 0.34, 1)
+CURRENT_BORDER = (0.00, 0.62, 0.95, 1)
+Window.clearcolor = BG_APP
+
+
+def _rgba255(rgba):
+    """Converte tupla RGBA 0-1 para bytes 0-255."""
+    return bytes(max(0, min(255, int(round(c * 255)))) for c in rgba)
+
+
+def make_vertical_gradient_texture(top_rgba, bottom_rgba):
+    """
+    Cria textura de gradiente vertical para os cards/botões.
+    Essa função estava faltando e causava o erro:
+    NameError: make_vertical_gradient_texture is not defined
+    """
+    texture = Texture.create(size=(1, 2), colorfmt="rgba")
+    buf = _rgba255(bottom_rgba) + _rgba255(top_rgba)
+    texture.blit_buffer(buf, colorfmt="rgba", bufferfmt="ubyte")
+    texture.wrap = "clamp_to_edge"
+    texture.mag_filter = "linear"
+    texture.min_filter = "linear"
+    return texture
+
 
 
 # =========================================================
@@ -435,14 +479,32 @@ def imprimir_zebra_ip(ip: str, porta: int, zpl: str, timeout: float = 5.0):
         s.sendall(zpl.encode("utf-8", errors="ignore"))
 
 
-def imprimir_zebra_usb_android(zpl: str) -> str:
-    """Envia ZPL para primeira impressora USB encontrada no Android.
+def _usb_device_basic_info(dev) -> str:
+    try:
+        return (
+            f"vendor=0x{int(dev.getVendorId()):04X} "
+            f"product=0x{int(dev.getProductId()):04X} "
+            f"class={int(dev.getDeviceClass())} "
+            f"interfaces={int(dev.getInterfaceCount())}"
+        )
+    except Exception:
+        return "USB device"
 
-    Observacao: na primeira tentativa o Android pode pedir permissao USB.
-    Depois de permitir, tente imprimir novamente.
+
+def _find_usb_printer_android(request_permission: bool = True):
+    """
+    Detecta automaticamente uma impressora USB no Android.
+
+    Critérios:
+    1) Preferência para Zebra vendorId 0x0A5F.
+    2) Depois, qualquer dispositivo/interface classe PRINTER = 7.
+    3) Depois, qualquer USB com endpoint BULK OUT.
+
+    Retorna:
+      usb_manager, device, interface, endpoint_out, info
     """
     if platform != "android":
-        raise RuntimeError("USB Android disponível somente no APK instalado no tablet.")
+        raise RuntimeError("USB disponível somente no APK instalado no tablet Android.")
 
     from jnius import autoclass, cast  # type: ignore
 
@@ -457,79 +519,133 @@ def imprimir_zebra_usb_android(zpl: str) -> str:
     usb_manager = cast("android.hardware.usb.UsbManager", activity.getSystemService(Context.USB_SERVICE))
     device_list = usb_manager.getDeviceList()
 
-    if device_list.isEmpty():
-        raise RuntimeError("Nenhum dispositivo USB encontrado. Conecte a Zebra no OTG.")
+    if device_list is None or device_list.isEmpty():
+        raise RuntimeError("Nenhum USB detectado. Conecte a Zebra no OTG/USB do tablet.")
+
+    candidates = []
+    dispositivos_vistos = []
 
     iterator = device_list.values().iterator()
-    chosen = None
     while iterator.hasNext():
         dev = iterator.next()
-        # Zebra costuma ser vendor 0x0A5F, mas deixamos aberto para testar qualquer USB printer.
-        chosen = dev
-        if int(dev.getVendorId()) == 0x0A5F:
-            chosen = dev
-            break
+        info_dev = _usb_device_basic_info(dev)
+        dispositivos_vistos.append(info_dev)
 
-    if chosen is None:
-        raise RuntimeError("Nenhuma impressora USB encontrada.")
+        vendor = int(dev.getVendorId())
+        product = int(dev.getProductId())
+        device_class = int(dev.getDeviceClass())
+
+        for i in range(dev.getInterfaceCount()):
+            itf = dev.getInterface(i)
+            interface_class = int(itf.getInterfaceClass())
+
+            for e in range(itf.getEndpointCount()):
+                ep = itf.getEndpoint(e)
+                is_bulk_out = (
+                    ep.getDirection() == UsbConstants.USB_DIR_OUT
+                    and ep.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK
+                )
+
+                if not is_bulk_out:
+                    continue
+
+                score = 0
+                if vendor == 0x0A5F:  # Zebra Technologies
+                    score += 100
+                if device_class == 7 or interface_class == 7:  # USB printer class
+                    score += 50
+
+                # Ainda aceita bulk OUT como fallback, pois algumas Zebras aparecem como vendor-specific.
+                score += 10
+
+                candidates.append((score, dev, itf, ep, vendor, product, device_class, interface_class))
+
+    if not candidates:
+        raise RuntimeError(
+            "Nenhuma impressora USB com endpoint BULK OUT encontrada. "
+            f"USBs vistos: {' | '.join(dispositivos_vistos)}"
+        )
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _score, chosen, interface, endpoint_out, vendor, product, device_class, interface_class = candidates[0]
+
+    info = (
+        f"USB detectado: vendor=0x{vendor:04X} product=0x{product:04X} "
+        f"device_class={device_class} interface_class={interface_class}"
+    )
 
     if not usb_manager.hasPermission(chosen):
-        flags = 0
-        try:
-            if int(Build.VERSION.SDK_INT) >= 23:
-                flags = PendingIntent.FLAG_IMMUTABLE
-        except Exception:
+        if request_permission:
             flags = 0
-        permission_intent = PendingIntent.getBroadcast(activity, 0, Intent("br.com.ibero.USB_PERMISSION"), flags)
-        usb_manager.requestPermission(chosen, permission_intent)
-        raise RuntimeError("Permissão USB solicitada. Autorize no Android e clique em imprimir novamente.")
+            try:
+                if int(Build.VERSION.SDK_INT) >= 23:
+                    flags = PendingIntent.FLAG_IMMUTABLE
+            except Exception:
+                flags = 0
+
+            permission_intent = PendingIntent.getBroadcast(
+                activity,
+                0,
+                Intent("br.com.ibero.USB_PERMISSION"),
+                flags,
+            )
+            usb_manager.requestPermission(chosen, permission_intent)
+
+        raise RuntimeError(
+            f"{info}. Permissão USB solicitada. Autorize no Android e clique em imprimir novamente."
+        )
+
+    return usb_manager, chosen, interface, endpoint_out, info
+
+
+def detectar_zebra_usb_android() -> str:
+    """Apenas detecta a impressora USB e solicita permissão se necessário."""
+    _usb_manager, _chosen, _interface, _endpoint_out, info = _find_usb_printer_android(request_permission=True)
+    return f"{info}. Permissão OK. Pronta para imprimir."
+
+
+def imprimir_zebra_usb_android(zpl: str) -> str:
+    """Detecta automaticamente a Zebra USB e envia o ZPL por bulkTransfer."""
+    usb_manager, chosen, interface, endpoint_out, info = _find_usb_printer_android(request_permission=True)
 
     connection = usb_manager.openDevice(chosen)
     if connection is None:
-        raise RuntimeError("Não foi possível abrir conexão USB com a Zebra.")
+        raise RuntimeError("USB detectado, mas não foi possível abrir conexão com a impressora.")
 
+    claimed = False
     try:
-        endpoint_out = None
-        interface = None
-        for i in range(chosen.getInterfaceCount()):
-            itf = chosen.getInterface(i)
-            for e in range(itf.getEndpointCount()):
-                ep = itf.getEndpoint(e)
-                if ep.getDirection() == UsbConstants.USB_DIR_OUT and ep.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK:
-                    interface = itf
-                    endpoint_out = ep
-                    break
-            if endpoint_out is not None:
-                break
-
-        if interface is None or endpoint_out is None:
-            raise RuntimeError("Endpoint USB OUT não encontrado na impressora.")
-
-        if not connection.claimInterface(interface, True):
-            raise RuntimeError("Não foi possível reservar interface USB da impressora.")
+        claimed = bool(connection.claimInterface(interface, True))
+        if not claimed:
+            raise RuntimeError("Não foi possível reservar a interface USB da impressora.")
 
         data = zpl.encode("utf-8", errors="ignore")
         offset = 0
         chunk_size = 4096
+
         while offset < len(data):
             chunk = data[offset:offset + chunk_size]
-            sent = connection.bulkTransfer(endpoint_out, chunk, len(chunk), 5000)
+            buffer = bytearray(chunk)
+
+            sent = connection.bulkTransfer(endpoint_out, buffer, len(buffer), 5000)
             if sent is None or int(sent) < 0:
                 raise RuntimeError("Falha no bulkTransfer USB para a Zebra.")
-            offset += len(chunk)
 
+            offset += int(sent) if int(sent) > 0 else len(chunk)
+
+        return f"ZPL enviado via USB. {info}"
+
+    finally:
         try:
-            connection.releaseInterface(interface)
+            if claimed:
+                connection.releaseInterface(interface)
         except Exception:
             pass
 
-    finally:
         try:
             connection.close()
         except Exception:
             pass
 
-    return f"ZPL enviado via USB para vendor={chosen.getVendorId()} product={chosen.getProductId()}"
 
 
 # =========================================================
@@ -778,90 +894,281 @@ class OpenProtocolClient:
 # =========================================================
 # WIDGETS
 # =========================================================
-class PCard(BoxLayout):
+class RoundedPanel(BoxLayout):
+    def __init__(self, bg=CARD_BG, border=CARD_BORDER, radius=18, **kwargs):
+        super().__init__(**kwargs)
+        self._bg = bg
+        self._border = border
+        self._radius = dp(radius) if isinstance(radius, (int, float)) else radius
+        with self.canvas.before:
+            self._bg_color = Color(*self._bg)
+            self._bg_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius] * 4)
+            self._border_color = Color(*self._border)
+            self._border_line = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, self._radius), width=1.15)
+        self.bind(pos=self._update_panel, size=self._update_panel)
+
+    def set_style(self, bg=None, border=None, line_width=1.15):
+        if bg is not None:
+            self._bg = bg
+            self._bg_color.rgba = bg
+        if border is not None:
+            self._border = border
+            self._border_color.rgba = border
+        self._border_line.width = line_width
+
+    def _update_panel(self, *_):
+        self._bg_rect.pos = self.pos
+        self._bg_rect.size = self.size
+        self._border_line.rounded_rectangle = (self.x, self.y, self.width, self.height, self._radius)
+
+
+class GradientPanel(BoxLayout):
+    def __init__(self, top_color=HEADER_TOP, bottom_color=HEADER_BOTTOM, border=FIELD_BORDER, radius=18, **kwargs):
+        super().__init__(**kwargs)
+        self._radius = dp(radius) if isinstance(radius, (int, float)) else radius
+        self._texture = make_vertical_gradient_texture(top_color, bottom_color)
+        with self.canvas.before:
+            self._color = Color(1, 1, 1, 1)
+            self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius] * 4, texture=self._texture)
+            self._border_color = Color(*border)
+            self._line = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, self._radius), width=1.10)
+        self.bind(pos=self._update, size=self._update)
+
+    def _update(self, *_):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+        self._line.rounded_rectangle = (self.x, self.y, self.width, self.height, self._radius)
+
+
+class StyledButton(Button):
+    def __init__(self, text='', primary=True, **kwargs):
+        kwargs.setdefault('size_hint_y', None)
+        kwargs.setdefault('height', dp(44))
+        super().__init__(text=text, background_normal='', background_down='', background_color=(0, 0, 0, 0), color=TEXT_LIGHT, bold=True, **kwargs)
+        self._radius = dp(14)
+        top, bottom, border = (BUTTON_TOP, BUTTON_BOTTOM, FIELD_BORDER) if primary else (BUTTON_SECONDARY_TOP, BUTTON_SECONDARY_BOTTOM, (0.38, 0.45, 0.56, 1))
+        self._texture = make_vertical_gradient_texture(top, bottom)
+        with self.canvas.before:
+            self._c = Color(1, 1, 1, 1)
+            self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius] * 4, texture=self._texture)
+            self._bc = Color(*border)
+            self._line = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, self._radius), width=1.1)
+        self.bind(pos=self._update_btn, size=self._update_btn)
+
+    def _update_btn(self, *_):
+        self._rect.pos = self.pos
+        self._rect.size = self.size
+        self._line.rounded_rectangle = (self.x, self.y, self.width, self.height, self._radius)
+
+
+class StyledInput(TextInput):
+    def __init__(self, hint='', navy=False, **kwargs):
+        kwargs.setdefault('multiline', False)
+        kwargs.setdefault('font_size', '16sp')
+        kwargs.setdefault('size_hint_y', None)
+        kwargs.setdefault('height', dp(48))
+        kwargs.setdefault('padding', [dp(14), dp(13), dp(14), dp(10)])
+        self._navy = navy
+        self._radius = dp(14)
+        self._texture = make_vertical_gradient_texture(FIELD_TOP, FIELD_BOTTOM)
+
+        # Para campo branco, escondo o texto nativo e desenho manualmente em preto.
+        # Em alguns Android/Kivy o foreground_color ficava cinza claro mesmo setando preto.
+        native_text_color = TEXT_LIGHT if navy else (0, 0, 0, 0)
+        native_hint_color = (0.92, 0.96, 1, 0.88) if navy else (0, 0, 0, 0)
+
+        super().__init__(
+            hint_text=hint,
+            foreground_color=native_text_color,
+            disabled_foreground_color=native_text_color,
+            hint_text_color=native_hint_color,
+            cursor_color=(1, 1, 1, 1) if navy else (0, 0, 0, 1),
+            selection_color=(1, 1, 1, 0.25) if navy else (0.20, 0.40, 0.80, 0.35),
+            background_color=(0, 0, 0, 0),
+            background_normal='',
+            background_active='',
+            write_tab=False,
+            **kwargs,
+        )
+
+        with self.canvas.before:
+            self._fill_color = Color(1, 1, 1, 1)
+            if navy:
+                self._fill_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius] * 4, texture=self._texture)
+                self._border_color = Color(*FIELD_BORDER)
+            else:
+                self._fill_rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[self._radius] * 4)
+                self._border_color = Color(*CARD_BORDER)
+            self._line = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, self._radius), width=1.05)
+
+        # Camada manual do texto preto para campos brancos.
+        self._manual_text_rect = None
+        self._manual_text_color = None
+        if not navy:
+            with self.canvas.after:
+                self._manual_text_color = Color(0, 0, 0, 1)
+                self._manual_text_rect = Rectangle(pos=(0, 0), size=(0, 0))
+
+        self.bind(pos=self._update_input, size=self._update_input)
+        self.bind(text=self._update_manual_text, hint_text=self._update_manual_text, focus=self._update_manual_text)
+
+        Clock.schedule_once(lambda dt: self._update_manual_text(), 0)
+
+    def _update_input(self, *_):
+        self._fill_rect.pos = self.pos
+        self._fill_rect.size = self.size
+        self._line.rounded_rectangle = (self.x, self.y, self.width, self.height, self._radius)
+        self._update_manual_text()
+
+    def _make_text_texture(self, txt, color):
+        # Mostra o final do texto se ficar maior que o campo.
+        max_w = max(20, self.width - dp(28))
+        draw_txt = txt or ''
+        while len(draw_txt) > 1:
+            label = CoreLabel(text=draw_txt, font_size=self.font_size, color=color)
+            label.refresh()
+            if label.texture.width <= max_w:
+                return label.texture
+            draw_txt = draw_txt[1:]
+
+        label = CoreLabel(text=draw_txt, font_size=self.font_size, color=color)
+        label.refresh()
+        return label.texture
+
+    def _update_manual_text(self, *_):
+        if self._navy or self._manual_text_rect is None:
+            return
+
+        if self.text:
+            txt = self.text
+            color = (0, 0, 0, 1)  # PRETO FORTE
+        else:
+            txt = self.hint_text or ''
+            color = (0.18, 0.22, 0.30, 1)  # placeholder mais escuro
+
+        if self._manual_text_color:
+            self._manual_text_color.rgba = color
+
+        if not txt:
+            self._manual_text_rect.texture = None
+            self._manual_text_rect.size = (0, 0)
+            return
+
+        tex = self._make_text_texture(txt, color)
+        self._manual_text_rect.texture = tex
+        self._manual_text_rect.size = tex.size
+        self._manual_text_rect.pos = (
+            self.x + dp(14),
+            self.center_y - tex.height / 2
+        )
+
+class PCard(RoundedPanel):
+    CARD_H = dp(194)
+
     def __init__(self, ponto: str, on_select, **kwargs):
-        super().__init__(orientation="vertical", padding=dp(10), spacing=dp(5), **kwargs)
-        # NÃO use self.pos para guardar P1/P2.
-        # self.pos é propriedade interna do Kivy para coordenadas (x, y).
-        # Sobrescrever isso faz o APK abrir, carregar e fechar sozinho.
+        super().__init__(
+            orientation='vertical',
+            padding=[dp(12), dp(10), dp(12), dp(10)],
+            spacing=dp(3),
+            bg=CARD_BG,
+            border=CARD_BORDER,
+            radius=18,
+            **kwargs
+        )
+        # NÃO use self.pos para guardar P1/P2. self.pos é propriedade interna do Kivy.
         self.ponto = ponto
         self.on_select = on_select
         self.size_hint_y = None
-        self.height = dp(165)
-        self.status = "AGUARDANDO"
+        self.height = self.CARD_H
+        self.status = 'AGUARDANDO'
         self._build()
 
     def _build(self):
-        from kivy.graphics import Color, RoundedRectangle, Line
-        self.bg_color = (0.06, 0.07, 0.08, 1)
-        self.border_color = (0.20, 0.22, 0.25, 1)
-        with self.canvas.before:
-            self._color = Color(*self.bg_color)
-            self._rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(12)])
-            self._line_color = Color(*self.border_color)
-            self._line = Line(rounded_rectangle=(self.x, self.y, self.width, self.height, dp(12)), width=1.3)
-        self.bind(pos=self._update_canvas, size=self._update_canvas)
-
-        self.lbl_pos = Label(text=self.ponto, font_size="24sp", bold=True, halign="left", valign="middle",
-                             size_hint_y=None, height=dp(32), color=(1, 1, 1, 1))
-        self.lbl_pos.bind(size=lambda w, s: setattr(w, "text_size", s))
+        self.lbl_pos = Label(
+            text=self.ponto,
+            font_size='24sp',
+            bold=True,
+            halign='left',
+            valign='middle',
+            size_hint_y=None,
+            height=dp(30),
+            color=TEXT_DARK,
+        )
+        self.lbl_pos.bind(size=lambda w, s: setattr(w, 'text_size', s))
         self.add_widget(self.lbl_pos)
 
-        self.lbl_status = Label(text="AGUARDANDO", font_size="14sp", bold=True, halign="left",
-                                size_hint_y=None, height=dp(26), color=(0.75, 0.78, 0.82, 1))
-        self.lbl_status.bind(size=lambda w, s: setattr(w, "text_size", s))
+        self.lbl_status = Label(
+            text='AGUARDANDO',
+            font_size='12sp',
+            bold=True,
+            halign='left',
+            valign='middle',
+            size_hint_y=None,
+            height=dp(22),
+            color=TEXT_MUTED,
+        )
+        self.lbl_status.bind(size=lambda w, s: setattr(w, 'text_size', s))
         self.add_widget(self.lbl_status)
 
-        self.lbl_torque = Label(text="Torque:", font_size="13sp", halign="left", size_hint_y=None, height=dp(24), color=(1, 1, 1, 1))
-        self.lbl_torque.bind(size=lambda w, s: setattr(w, "text_size", s))
+        self.lbl_torque = Label(text='Torque:', font_size='12sp', halign='left', valign='middle', size_hint_y=None, height=dp(22), color=TEXT_DARK)
+        self.lbl_torque.bind(size=lambda w, s: setattr(w, 'text_size', s))
         self.add_widget(self.lbl_torque)
 
-        self.lbl_angulo = Label(text="Ângulo:", font_size="13sp", halign="left", size_hint_y=None, height=dp(24), color=(1, 1, 1, 1))
-        self.lbl_angulo.bind(size=lambda w, s: setattr(w, "text_size", s))
+        self.lbl_angulo = Label(text='Ângulo:', font_size='12sp', halign='left', valign='middle', size_hint_y=None, height=dp(22), color=TEXT_DARK)
+        self.lbl_angulo.bind(size=lambda w, s: setattr(w, 'text_size', s))
         self.add_widget(self.lbl_angulo)
 
-        self.lbl_info = Label(text="Tentativas: 0 | NOK: 0", font_size="11sp", halign="left", size_hint_y=None, height=dp(20), color=(0.80, 0.84, 0.90, 1))
-        self.lbl_info.bind(size=lambda w, s: setattr(w, "text_size", s))
+        self.lbl_info = Label(text='Tentativas: 0 | NOK: 0', font_size='9sp', halign='left', valign='middle', size_hint_y=None, height=dp(17), color=TEXT_MUTED)
+        self.lbl_info.bind(size=lambda w, s: setattr(w, 'text_size', s))
         self.add_widget(self.lbl_info)
 
-        btn = Button(text=f"Selecionar {self.ponto}", size_hint_y=None, height=dp(34), font_size="12sp")
-        btn.bind(on_release=lambda *_: self.on_select(self.ponto))
-        self.add_widget(btn)
+        self.lbl_time = Label(text='', font_size='8sp', halign='left', valign='middle', size_hint_y=None, height=dp(14), color=TEXT_MUTED)
+        self.lbl_time.bind(size=lambda w, s: setattr(w, 'text_size', s))
+        self.add_widget(self.lbl_time)
 
-    def _update_canvas(self, *args):
-        self._rect.pos = self.pos
-        self._rect.size = self.size
-        self._line.rounded_rectangle = (self.x, self.y, self.width, self.height, dp(12))
-
-    def set_colors(self, bg, border):
-        self.bg_color = bg
-        self.border_color = border
-        self._color.rgba = bg
-        self._line_color.rgba = border
+        self.btn = StyledButton(text=f'Selecionar {self.ponto}', primary=False, size_hint_y=None, height=dp(30), font_size='10sp')
+        self.btn.bind(on_release=lambda *_: self.on_select(self.ponto))
+        self.add_widget(self.btn)
 
     def update_data(self, state: PState, current: bool):
-        if current:
-            bg = (0.03, 0.14, 0.25, 1)
-            border = (0.00, 0.82, 1.0, 1)
-            status_color = (0.00, 0.82, 1.0, 1)
-        elif state.status == "OK":
-            bg = (0.02, 0.18, 0.08, 1)
-            border = (0.00, 0.78, 0.32, 1)
-            status_color = (0.00, 0.95, 0.46, 1)
-        elif state.status == "AGUARDANDO RETESTE":
-            bg = (0.23, 0.18, 0.00, 1)
-            border = (1.00, 0.84, 0.00, 1)
-            status_color = (1.00, 0.84, 0.00, 1)
+        # OK tem prioridade sobre CURRENT para o P8 ficar verde antes do reset automático.
+        if state.status == 'OK':
+            bg = (0.06, 0.38, 0.18, 1)
+            border = (0.10, 0.85, 0.36, 1)
+            status_color = (1, 1, 1, 1)
+            main_text = (1, 1, 1, 1)
+            muted = (0.88, 1, 0.92, 1)
+        elif state.status == 'AGUARDANDO RETESTE':
+            bg = (1.00, 0.96, 0.78, 1)
+            border = WARNING
+            status_color = (0.52, 0.34, 0.00, 1)
+            main_text = TEXT_DARK
+            muted = (0.52, 0.34, 0.00, 1)
+        elif current:
+            bg = CURRENT_BLUE
+            border = CURRENT_BORDER
+            status_color = (0.35, 0.88, 1.0, 1)
+            main_text = TEXT_LIGHT
+            muted = (0.86, 0.92, 0.98, 1)
         else:
-            bg = (0.06, 0.07, 0.08, 1)
-            border = (0.20, 0.22, 0.25, 1)
-            status_color = (0.75, 0.78, 0.82, 1)
-        self.set_colors(bg, border)
+            bg = CARD_BG
+            border = CARD_BORDER
+            status_color = TEXT_MUTED
+            main_text = TEXT_DARK
+            muted = TEXT_MUTED
+
+        self.set_style(bg, border, line_width=1.9 if current or state.status in ('OK', 'AGUARDANDO RETESTE') else 1.15)
+        self.lbl_pos.color = main_text
         self.lbl_status.text = state.status
         self.lbl_status.color = status_color
-        self.lbl_torque.text = f"Torque: {to_float_text(state.torque)}"
-        self.lbl_angulo.text = f"Ângulo: {to_float_text(state.angulo)}"
-        self.lbl_info.text = f"Tentativas: {state.tentativas} | NOK: {state.nok_count}"
+        self.lbl_torque.color = main_text
+        self.lbl_angulo.color = main_text
+        self.lbl_info.color = muted
+        self.lbl_time.color = muted
+        self.lbl_torque.text = f'Torque: {to_float_text(state.torque)}'
+        self.lbl_angulo.text = f'Ângulo: {to_float_text(state.angulo)}'
+        self.lbl_info.text = f'Tentativas: {state.tentativas} | NOK: {state.nok_count}'
+        self.lbl_time.text = state.data_hora or ''
 
 
 # =========================================================
@@ -883,37 +1190,51 @@ class TorquePF6000App(App):
         self.processed_frame_hash_time: Dict[str, float] = {}
         self.ciclo_em_reset = False
 
-        self.root_box = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
+        # Scroll principal: em tablet menor dá para rolar a tela sem deformar layout.
+        self.main_scroll = ScrollView(do_scroll_x=False, do_scroll_y=True, bar_width=dp(8))
+        self.root_box = BoxLayout(orientation="vertical", padding=[dp(12), dp(10), dp(12), dp(14)], spacing=dp(8), size_hint_y=None)
+        self.root_box.bind(minimum_height=self.root_box.setter("height"))
+        self.main_scroll.add_widget(self.root_box)
+
         self._build_top()
         self._build_cards()
         self._build_bottom_log()
 
         Clock.schedule_interval(self._poll_events, 0.1)
         self._refresh_all()
-        return self.root_box
+        return self.main_scroll
 
     def _build_top(self):
-        header = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(58), spacing=dp(8))
-        title_box = BoxLayout(orientation="vertical")
-        title_box.add_widget(Label(text="Controle de Torque Mola - PF6000", font_size="22sp", bold=True, halign="left", color=(1, 1, 1, 1)))
-        self.lbl_msg = Label(text="Aguardando conexão.", font_size="13sp", halign="left", color=(1, 0.90, 0.30, 1))
+        header = GradientPanel(orientation="horizontal", size_hint_y=None, height=dp(74), padding=dp(14), spacing=dp(10), radius=20)
+        title_box = BoxLayout(orientation="vertical", spacing=dp(2))
+        lbl_title = Label(text="Controle de Torque Mola - PF6000", font_size="22sp", bold=True, halign="left", valign="middle", color=TEXT_LIGHT)
+        lbl_title.bind(size=lambda w, s: setattr(w, "text_size", s))
+        title_box.add_widget(lbl_title)
+        self.lbl_msg = Label(text="Aguardando conexão.", font_size="12sp", halign="left", valign="middle", color=(0.92, 0.96, 1, 1))
+        self.lbl_msg.bind(size=lambda w, s: setattr(w, "text_size", s))
         title_box.add_widget(self.lbl_msg)
         header.add_widget(title_box)
-        btn_cfg = Button(text="CONFIG", size_hint_x=None, width=dp(130), font_size="14sp")
+        btn_cfg = StyledButton(text="CONFIG", primary=False, size_hint_x=None, width=dp(130), height=dp(44), font_size="13sp")
         btn_cfg.bind(on_release=lambda *_: self.open_config_popup())
         header.add_widget(btn_cfg)
         self.root_box.add_widget(header)
 
-        data_row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(54), spacing=dp(8))
-        self.in_serie = TextInput(hint_text="Nº Série / Rastreio", multiline=False, font_size="16sp")
-        self.in_op = TextInput(hint_text="OP", multiline=False, font_size="16sp")
-        data_row.add_widget(self.in_serie)
-        data_row.add_widget(self.in_op)
-        self.root_box.add_widget(data_row)
+        # Somente número de série/rastreio na tela principal. OP fica em branco internamente.
+        data_card = RoundedPanel(orientation="vertical", bg=CARD_BG, border=CARD_BORDER, radius=18, size_hint_y=None, height=dp(82), padding=dp(10), spacing=dp(5))
+        lbl_serie = Label(text="Nº Série / Rastreio", font_size="11sp", color=TEXT_MUTED, halign="left", size_hint_y=None, height=dp(18))
+        lbl_serie.bind(size=lambda w, s: setattr(w, "text_size", s))
+        data_card.add_widget(lbl_serie)
+        self.in_serie = StyledInput("Bipe ou digite a série", navy=False, input_type="text")
+        # Texto do número de série é desenhado manualmente em preto pela classe StyledInput.
+        data_card.add_widget(self.in_serie)
 
-        status_row = GridLayout(cols=5, size_hint_y=None, height=dp(58), spacing=dp(6))
+        # Compatibilidade com as rotinas de CSV antigas que ainda leem self.in_op.text.
+        self.in_op = TextInput(text="", multiline=False, opacity=0, size_hint=(None, None), size=(0, 0))
+        self.root_box.add_widget(data_card)
+
+        status_row = GridLayout(cols=5, size_hint_y=None, height=dp(66), spacing=dp(8))
         self.lbl_tcp = self._metric("TCP", "OFF")
-        self.lbl_open = self._metric("Open", "OFF")
+        self.lbl_open = self._metric("Open Protocol", "OFF")
         self.lbl_mid = self._metric("MID", "-")
         self.lbl_pos = self._metric("Atual", "P1")
         self.lbl_geral = self._metric("Status", "PENDENTE")
@@ -922,44 +1243,56 @@ class TorquePF6000App(App):
         self.root_box.add_widget(status_row)
 
     def _metric(self, title: str, value: str) -> BoxLayout:
-        b = BoxLayout(orientation="vertical", padding=dp(6))
-        b.add_widget(Label(text=title, font_size="11sp", color=(0.75, 0.80, 0.88, 1), size_hint_y=0.35))
-        lab = Label(text=value, font_size="18sp", bold=True, color=(1, 1, 1, 1), size_hint_y=0.65)
+        b = RoundedPanel(orientation="vertical", padding=dp(8), bg=CARD_BG, border=CARD_BORDER, radius=16)
+        t = Label(text=title, font_size="10sp", color=TEXT_MUTED, size_hint_y=0.35, halign="left", valign="middle")
+        t.bind(size=lambda w, s: setattr(w, "text_size", s))
+        b.add_widget(t)
+        lab = Label(text=value, font_size="17sp", bold=True, color=TEXT_DARK, size_hint_y=0.65, halign="left", valign="middle")
+        lab.bind(size=lambda w, s: setattr(w, "text_size", s))
         b.value_label = lab  # type: ignore
         b.add_widget(lab)
         return b
 
     def _build_cards(self):
+        lbl = Label(text="Pontos de aperto", font_size="19sp", bold=True, color=TEXT_DARK, halign="left", valign="middle", size_hint_y=None, height=dp(30))
+        lbl.bind(size=lambda w, s: setattr(w, "text_size", s))
+        self.root_box.add_widget(lbl)
+
         self.cards: Dict[str, PCard] = {}
-        grid = GridLayout(cols=4, spacing=dp(8), size_hint_y=None)
-        grid.bind(minimum_height=grid.setter("height"))
-        for p in POSICOES:
-            card = PCard(p, on_select=self.select_position)
-            self.cards[p] = card
-            grid.add_widget(card)
-        # 2 linhas x 165 + espaçamento
-        grid.height = dp(345)
-        self.root_box.add_widget(grid)
+        cards_wrap = BoxLayout(orientation="vertical", spacing=dp(10), size_hint_y=None, height=(PCard.CARD_H * 2 + dp(10)))
+
+        for row_points in (POSICOES[:4], POSICOES[4:]):
+            row = BoxLayout(orientation="horizontal", spacing=dp(10), size_hint_y=None, height=PCard.CARD_H)
+            for p in row_points:
+                card = PCard(p, on_select=self.select_position)
+                card.size_hint_x = 1
+                self.cards[p] = card
+                row.add_widget(card)
+            cards_wrap.add_widget(row)
+
+        self.root_box.add_widget(cards_wrap)
 
     def _build_bottom_log(self):
-        row = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(52), spacing=dp(8))
-        self.btn_connect = Button(text="Conectar", font_size="14sp")
+        row = GridLayout(cols=4, size_hint_y=None, height=dp(46), spacing=dp(8))
+        self.btn_connect = StyledButton(text="Conectar", primary=True, font_size="13sp")
         self.btn_connect.bind(on_release=lambda *_: self.connect())
         row.add_widget(self.btn_connect)
-        btn_stop = Button(text="Desconectar", font_size="14sp")
+        btn_stop = StyledButton(text="Desconectar", primary=False, font_size="13sp")
         btn_stop.bind(on_release=lambda *_: self.client.stop())
         row.add_widget(btn_stop)
-        btn_reset = Button(text="Reset ciclo", font_size="14sp")
+        btn_reset = StyledButton(text="Reset ciclo", primary=False, font_size="13sp")
         btn_reset.bind(on_release=lambda *_: self.reset_cycle(clear_history=False))
         row.add_widget(btn_reset)
-        btn_print = Button(text="Imprimir etiqueta", font_size="14sp")
+        btn_print = StyledButton(text="Imprimir etiqueta", primary=True, font_size="13sp")
         btn_print.bind(on_release=lambda *_: self.print_current_label())
         row.add_widget(btn_print)
         self.root_box.add_widget(row)
 
-        self.log_label = Label(text="", font_size="11sp", color=(0.75, 0.80, 0.88, 1), halign="left", valign="top")
+        log_panel = RoundedPanel(orientation="vertical", bg=(0.98, 0.99, 1, 1), border=CARD_BORDER, radius=16, size_hint_y=None, height=dp(76), padding=dp(8))
+        self.log_label = Label(text="", font_size="10sp", color=TEXT_MUTED, halign="left", valign="top")
         self.log_label.bind(size=lambda w, s: setattr(w, "text_size", s))
-        self.root_box.add_widget(self.log_label)
+        log_panel.add_widget(self.log_label)
+        self.root_box.add_widget(log_panel)
         self.logs: List[str] = []
 
     def open_config_popup(self):
@@ -968,97 +1301,145 @@ class TorquePF6000App(App):
         inner = GridLayout(cols=2, spacing=dp(8), size_hint_y=None)
         inner.bind(minimum_height=inner.setter("height"))
 
-        self.cfg_ip = TextInput(text=getattr(self, "cfg_ip", DEFAULT_IP) if isinstance(getattr(self, "cfg_ip", None), str) else DEFAULT_IP, multiline=False)
-        self.cfg_port = TextInput(text=getattr(self, "cfg_port", str(DEFAULT_PORT)) if isinstance(getattr(self, "cfg_port", None), str) else str(DEFAULT_PORT), multiline=False)
-        self.cfg_rev0060 = Spinner(text=getattr(self, "cfg_rev0060", "001") if isinstance(getattr(self, "cfg_rev0060", None), str) else "001", values=["001", "002", "003", "004", "005", "006", "007", "008"])
-        self.cfg_rev0062 = Spinner(text=getattr(self, "cfg_rev0062", "001") if isinstance(getattr(self, "cfg_rev0062", None), str) else "001", values=["001", "002", "003", "004", "005", "006", "007", "008"])
-        self.cfg_modelo = TextInput(text=getattr(self, "cfg_modelo", "MOLA") if isinstance(getattr(self, "cfg_modelo", None), str) else "MOLA", multiline=False)
-        self.cfg_tmin = TextInput(text=getattr(self, "cfg_tmin", "0") if isinstance(getattr(self, "cfg_tmin", None), str) else "0", multiline=False)
-        self.cfg_tmax = TextInput(text=getattr(self, "cfg_tmax", "9999") if isinstance(getattr(self, "cfg_tmax", None), str) else "9999", multiline=False)
-        self.cfg_tdiv = Spinner(text=getattr(self, "cfg_tdiv", "100") if isinstance(getattr(self, "cfg_tdiv", None), str) else "100", values=["1", "10", "100", "1000"])
-        self.cfg_adiv = Spinner(text=getattr(self, "cfg_adiv", "1") if isinstance(getattr(self, "cfg_adiv", None), str) else "1", values=["1", "10", "100"])
-        self.cfg_tfield = Spinner(text=getattr(self, "cfg_tfield", "AUTO") if isinstance(getattr(self, "cfg_tfield", None), str) else "AUTO", values=["AUTO", "15", "24", "12", "13", "14", "21", "22", "23"])
-        self.cfg_afield = Spinner(text=getattr(self, "cfg_afield", "AUTO") if isinstance(getattr(self, "cfg_afield", None), str) else "AUTO", values=["AUTO", "19", "28", "16", "17", "18", "25", "26", "27"])
-        self.cfg_print_mode = Spinner(text=getattr(self, "cfg_print_mode", "SALVAR") if isinstance(getattr(self, "cfg_print_mode", None), str) else "SALVAR", values=["SALVAR", "USB", "IP"])
-        self.cfg_zebra_ip = TextInput(text=getattr(self, "cfg_zebra_ip", "192.168.0.50") if isinstance(getattr(self, "cfg_zebra_ip", None), str) else "192.168.0.50", multiline=False)
-        self.cfg_zebra_port = TextInput(text=getattr(self, "cfg_zebra_port", "9100") if isinstance(getattr(self, "cfg_zebra_port", None), str) else "9100", multiline=False)
-        self.cfg_copias = TextInput(text=getattr(self, "cfg_copias", "1") if isinstance(getattr(self, "cfg_copias", None), str) else "1", multiline=False)
+        # Importante:
+        # Widgets do popup usam prefixo w_cfg_.
+        # Valores persistidos ficam em cfg_.
+        # Isso evita o erro: AttributeError: 'str' object has no attribute 'text'
+        self.w_cfg_ip = TextInput(text=str(getattr(self, "cfg_ip", DEFAULT_IP)), multiline=False)
+        self.w_cfg_port = TextInput(text=str(getattr(self, "cfg_port", str(DEFAULT_PORT))), multiline=False)
+        self.w_cfg_rev0060 = Spinner(text=str(getattr(self, "cfg_rev0060", "001")), values=["001", "002", "003", "004", "005", "006", "007", "008"])
+        self.w_cfg_rev0062 = Spinner(text=str(getattr(self, "cfg_rev0062", "001")), values=["001", "002", "003", "004", "005", "006", "007", "008"])
+        self.w_cfg_modelo = TextInput(text=str(getattr(self, "cfg_modelo", "MOLA")), multiline=False)
+        self.w_cfg_tmin = TextInput(text=str(getattr(self, "cfg_tmin", "0")), multiline=False)
+        self.w_cfg_tmax = TextInput(text=str(getattr(self, "cfg_tmax", "9999")), multiline=False)
+        self.w_cfg_tdiv = Spinner(text=str(getattr(self, "cfg_tdiv", "100")), values=["1", "10", "100", "1000"])
+        self.w_cfg_adiv = Spinner(text=str(getattr(self, "cfg_adiv", "1")), values=["1", "10", "100"])
+        self.w_cfg_tfield = Spinner(text=str(getattr(self, "cfg_tfield", "AUTO")), values=["AUTO", "15", "24", "12", "13", "14", "21", "22", "23"])
+        self.w_cfg_afield = Spinner(text=str(getattr(self, "cfg_afield", "AUTO")), values=["AUTO", "19", "28", "16", "17", "18", "25", "26", "27"])
+        self.w_cfg_print_mode = Spinner(text=str(getattr(self, "cfg_print_mode", "USB")), values=["USB", "SALVAR"])
+        self.w_cfg_copias = TextInput(text=str(getattr(self, "cfg_copias", "1")), multiline=False)
 
-        self.cfg_auto_reconnect = CheckBox(active=getattr(self, "cfg_auto_reconnect", True) if isinstance(getattr(self, "cfg_auto_reconnect", True), bool) else True)
-        self.cfg_panel_status = CheckBox(active=getattr(self, "cfg_panel_status", True) if isinstance(getattr(self, "cfg_panel_status", True), bool) else True)
-        self.cfg_auto_print = CheckBox(active=getattr(self, "cfg_auto_print", False) if isinstance(getattr(self, "cfg_auto_print", False), bool) else False)
+        self.w_cfg_auto_reconnect = CheckBox(active=bool(getattr(self, "cfg_auto_reconnect", True)))
+        self.w_cfg_panel_status = CheckBox(active=bool(getattr(self, "cfg_panel_status", True)))
+        self.w_cfg_auto_print = CheckBox(active=bool(getattr(self, "cfg_auto_print", True)))
 
         def add(label, widget):
-            inner.add_widget(Label(text=label, font_size="14sp", color=(1, 1, 1, 1), size_hint_y=None, height=dp(44)))
+            inner.add_widget(Label(
+                text=label,
+                font_size="14sp",
+                color=TEXT_DARK,
+                halign="left",
+                valign="middle",
+                size_hint_y=None,
+                height=dp(44),
+            ))
             widget.size_hint_y = None
             widget.height = dp(44)
             inner.add_widget(widget)
 
-        add("IP PF6000", self.cfg_ip)
-        add("Porta PF6000", self.cfg_port)
-        add("REV 0060", self.cfg_rev0060)
-        add("REV 0062", self.cfg_rev0062)
-        add("Auto-reconectar", self.cfg_auto_reconnect)
-        add("Usar OK/NOK painel", self.cfg_panel_status)
-        add("Modelo", self.cfg_modelo)
-        add("Torque mínimo", self.cfg_tmin)
-        add("Torque máximo", self.cfg_tmax)
-        add("Campo torque", self.cfg_tfield)
-        add("Campo ângulo", self.cfg_afield)
-        add("Divisor torque", self.cfg_tdiv)
-        add("Divisor ângulo", self.cfg_adiv)
-        add("Modo impressão", self.cfg_print_mode)
-        add("Auto imprimir P8 OK", self.cfg_auto_print)
-        add("IP Zebra", self.cfg_zebra_ip)
-        add("Porta Zebra", self.cfg_zebra_port)
-        add("Cópias", self.cfg_copias)
+        add("IP PF6000", self.w_cfg_ip)
+        add("Porta PF6000", self.w_cfg_port)
+        add("REV 0060", self.w_cfg_rev0060)
+        add("REV 0062", self.w_cfg_rev0062)
+        add("Auto-reconectar", self.w_cfg_auto_reconnect)
+        add("Usar OK/NOK painel", self.w_cfg_panel_status)
+        add("Modelo", self.w_cfg_modelo)
+        add("Torque mínimo", self.w_cfg_tmin)
+        add("Torque máximo", self.w_cfg_tmax)
+        add("Campo torque", self.w_cfg_tfield)
+        add("Campo ângulo", self.w_cfg_afield)
+        add("Divisor torque", self.w_cfg_tdiv)
+        add("Divisor ângulo", self.w_cfg_adiv)
+        add("Modo impressão", self.w_cfg_print_mode)
+        add("Auto imprimir P8 OK", self.w_cfg_auto_print)
+        add("Cópias", self.w_cfg_copias)
 
         scroll.add_widget(inner)
         content.add_widget(scroll)
+
         row = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(8))
-        btn_save = Button(text="Salvar")
-        btn_test = Button(text="Teste Zebra")
-        btn_close = Button(text="Fechar")
+        btn_save = StyledButton(text="Salvar", primary=True)
+        btn_detect = StyledButton(text="Detectar USB", primary=False)
+        btn_test = StyledButton(text="Teste Zebra", primary=False)
+        btn_close = StyledButton(text="Fechar", primary=False)
+
         row.add_widget(btn_save)
+        row.add_widget(btn_detect)
         row.add_widget(btn_test)
         row.add_widget(btn_close)
         content.add_widget(row)
-        popup = Popup(title="Configurações", content=content, size_hint=(0.92, 0.92))
+
+        popup = Popup(title="Configurações", content=content, size_hint=(0.94, 0.94))
+
         btn_save.bind(on_release=lambda *_: (self.save_config_from_popup(), popup.dismiss()))
+        btn_detect.bind(on_release=lambda *_: self.detect_usb_from_popup())
         btn_test.bind(on_release=lambda *_: self.test_print_from_popup())
         btn_close.bind(on_release=lambda *_: popup.dismiss())
+
         popup.open()
 
+    def _popup_text(self, widget_attr: str, stored_attr: str, default: str = "") -> str:
+        obj = getattr(self, widget_attr, None)
+        if hasattr(obj, "text"):
+            return str(obj.text)
+        return str(getattr(self, stored_attr, default))
+
+    def _popup_active(self, widget_attr: str, stored_attr: str, default: bool = False) -> bool:
+        obj = getattr(self, widget_attr, None)
+        if hasattr(obj, "active"):
+            return bool(obj.active)
+        return bool(getattr(self, stored_attr, default))
+
     def save_config_from_popup(self):
-        self.cfg_ip = self.cfg_ip.text
-        self.cfg_port = self.cfg_port.text
-        self.cfg_rev0060 = self.cfg_rev0060.text
-        self.cfg_rev0062 = self.cfg_rev0062.text
-        self.cfg_auto_reconnect = self.cfg_auto_reconnect.active
-        self.cfg_panel_status = self.cfg_panel_status.active
-        self.cfg_auto_print = self.cfg_auto_print.active
-        self.cfg_modelo = self.cfg_modelo.text
-        self.cfg_tmin = self.cfg_tmin.text
-        self.cfg_tmax = self.cfg_tmax.text
-        self.cfg_tdiv = self.cfg_tdiv.text
-        self.cfg_adiv = self.cfg_adiv.text
-        self.cfg_tfield = self.cfg_tfield.text
-        self.cfg_afield = self.cfg_afield.text
-        self.cfg_print_mode = self.cfg_print_mode.text
-        self.cfg_zebra_ip = self.cfg_zebra_ip.text
-        self.cfg_zebra_port = self.cfg_zebra_port.text
-        self.cfg_copias = self.cfg_copias.text
+        self.cfg_ip = self._popup_text("w_cfg_ip", "cfg_ip", DEFAULT_IP)
+        self.cfg_port = self._popup_text("w_cfg_port", "cfg_port", str(DEFAULT_PORT))
+        self.cfg_rev0060 = self._popup_text("w_cfg_rev0060", "cfg_rev0060", "001")
+        self.cfg_rev0062 = self._popup_text("w_cfg_rev0062", "cfg_rev0062", "001")
+        self.cfg_auto_reconnect = self._popup_active("w_cfg_auto_reconnect", "cfg_auto_reconnect", True)
+        self.cfg_panel_status = self._popup_active("w_cfg_panel_status", "cfg_panel_status", True)
+        self.cfg_auto_print = self._popup_active("w_cfg_auto_print", "cfg_auto_print", True)
+        self.cfg_modelo = self._popup_text("w_cfg_modelo", "cfg_modelo", "MOLA")
+        self.cfg_tmin = self._popup_text("w_cfg_tmin", "cfg_tmin", "0")
+        self.cfg_tmax = self._popup_text("w_cfg_tmax", "cfg_tmax", "9999")
+        self.cfg_tdiv = self._popup_text("w_cfg_tdiv", "cfg_tdiv", "100")
+        self.cfg_adiv = self._popup_text("w_cfg_adiv", "cfg_adiv", "1")
+        self.cfg_tfield = self._popup_text("w_cfg_tfield", "cfg_tfield", "AUTO")
+        self.cfg_afield = self._popup_text("w_cfg_afield", "cfg_afield", "AUTO")
+        self.cfg_print_mode = self._popup_text("w_cfg_print_mode", "cfg_print_mode", "USB")
+        self.cfg_copias = self._popup_text("w_cfg_copias", "cfg_copias", "1")
         self.set_msg("Configurações salvas.")
+
+    def detect_usb_from_popup(self):
+        self.save_config_from_popup()
+        try:
+            msg = detectar_zebra_usb_android()
+            self.set_msg(msg)
+            self.add_log(msg)
+        except Exception as e:
+            msg = f"USB: {e}"
+            self.set_msg(msg)
+            self.add_log(msg)
 
     def test_print_from_popup(self):
         self.save_config_from_popup()
         old = self.posicoes
-        demo = {p: PState(status="OK", ultimo_status="OK", torque=465 + i, angulo=90, data_hora=now_br()) for i, p in enumerate(POSICOES)}
+        demo = {
+            p: PState(
+                status="OK",
+                ultimo_status="OK",
+                torque=465 + i,
+                angulo=90,
+                data_hora=now_br(),
+            )
+            for i, p in enumerate(POSICOES)
+        }
         self.posicoes = demo
         try:
             self.print_current_label()
         finally:
             self.posicoes = old
+            self._refresh_all()
+
 
     # -----------------------------------------------------
     # EVENTOS
@@ -1197,7 +1578,6 @@ class TorquePF6000App(App):
         registro = {
             "data_hora": now_br(),
             "serie": self.in_serie.text,
-            "op": self.in_op.text,
             "posicao": p,
             "status": status_final,
             "torque": state.torque,
@@ -1221,7 +1601,8 @@ class TorquePF6000App(App):
             else:
                 self.set_msg("P8 aprovado. Ciclo finalizado. Imprimindo etiqueta e resetando...")
                 self.save_cycle_csv()
-                if bool(getattr(self, "cfg_auto_print", True)):
+                self.save_cycle_summary_csv()
+                if bool(getattr(self, "cfg_auto_print", False)):
                     self.print_current_label()
                 self.ciclo_em_reset = True
                 Clock.schedule_once(lambda *_: self.auto_reset_after_p8(), AUTO_RESET_AFTER_SEC)
@@ -1247,7 +1628,7 @@ class TorquePF6000App(App):
     def save_attempt_csv(self, registro: Dict[str, Any]):
         serie = (registro.get("serie") or "SEM_SERIE").replace("/", "_").replace("\\", "_").strip()
         arquivo = CSV_DIR / f"tentativas_{serie}_{datetime.now().strftime('%Y%m%d')}.csv"
-        fieldnames = ["data_hora", "serie", "op", "posicao", "status", "torque", "angulo", "pset", "revision", "tightening_id", "frame_hash", "parser_info", "frame"]
+        fieldnames = ["data_hora", "serie", "posicao", "status", "torque", "angulo", "pset", "revision", "tightening_id", "frame_hash", "parser_info", "frame"]
         write_header = not arquivo.exists()
         with arquivo.open("a", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames, delimiter=";")
@@ -1258,7 +1639,7 @@ class TorquePF6000App(App):
     def save_cycle_csv(self):
         serie = (self.in_serie.text or "SEM_SERIE").replace("/", "_").replace("\\", "_").strip()
         arquivo = CSV_DIR / f"ciclo_final_{serie}_{now_file()}.csv"
-        fieldnames = ["data_hora", "serie", "op", "posicao", "status", "torque", "angulo", "pset", "tentativas", "nok_count", "tightening_id"]
+        fieldnames = ["data_hora", "serie", "posicao", "status", "torque", "angulo", "pset", "tentativas", "nok_count", "tightening_id"]
         with arquivo.open("w", newline="", encoding="utf-8-sig") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames, delimiter=";")
             w.writeheader()
@@ -1267,8 +1648,7 @@ class TorquePF6000App(App):
                 w.writerow({
                     "data_hora": stt.data_hora,
                     "serie": self.in_serie.text,
-                    "op": self.in_op.text,
-                    "posicao": p,
+                            "posicao": p,
                     "status": stt.ultimo_status or stt.status,
                     "torque": stt.torque,
                     "angulo": stt.angulo,
@@ -1279,28 +1659,74 @@ class TorquePF6000App(App):
                 })
         self.add_log(f"Ciclo salvo: {arquivo}")
 
+    def save_cycle_summary_csv(self):
+        """
+        CSV único acumulativo.
+        A cada P8 OK, adiciona uma nova linha com o resumo dos 8 pontos.
+        """
+        arquivo = CSV_DIR / "ciclos_torque_resumo.csv"
+
+        fieldnames = [
+            "finalizado_em",
+            "serie",
+            "status_geral",
+        ]
+
+        for p in POSICOES:
+            fieldnames.extend([
+                f"{p}_torque",
+                f"{p}_status",
+                f"{p}_angulo",
+                f"{p}_tentativas",
+                f"{p}_nok",
+                f"{p}_tightening_id",
+            ])
+
+        row = {
+            "finalizado_em": now_br(),
+            "serie": self.in_serie.text or "SEM_SERIE",
+            "status_geral": "OK",
+        }
+
+        for p in POSICOES:
+            stt = self.posicoes[p]
+            row[f"{p}_torque"] = to_float_text(stt.torque)
+            row[f"{p}_status"] = stt.ultimo_status or stt.status
+            row[f"{p}_angulo"] = to_float_text(stt.angulo)
+            row[f"{p}_tentativas"] = stt.tentativas
+            row[f"{p}_nok"] = stt.nok_count
+            row[f"{p}_tightening_id"] = stt.tightening_id
+
+        write_header = not arquivo.exists()
+        with arquivo.open("a", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames, delimiter=";")
+            if write_header:
+                w.writeheader()
+            w.writerow(row)
+
+        self.add_log(f"Resumo acumulado atualizado: {arquivo}")
+
     def print_current_label(self):
         copias = safe_int(getattr(self, "cfg_copias", "1"), 1)
         zpl = gerar_zpl_torque(self.in_serie.text, self.posicoes, copias=copias)
+
         safe_serie = (self.in_serie.text or "SEM_SERIE").replace("/", "_").replace("\\", "_").strip()
         zpl_path = CSV_DIR / f"etiqueta_torque_{safe_serie}_{now_file()}.zpl"
         zpl_path.write_text(zpl, encoding="utf-8")
 
-        mode = getattr(self, "cfg_print_mode", "SALVAR")
+        mode = getattr(self, "cfg_print_mode", "USB")
         try:
             if mode == "USB":
                 msg = imprimir_zebra_usb_android(zpl)
                 self.set_msg(msg)
-            elif mode == "IP":
-                ip = getattr(self, "cfg_zebra_ip", "192.168.0.50")
-                port = safe_int(getattr(self, "cfg_zebra_port", "9100"), 9100)
-                imprimir_zebra_ip(ip, port, zpl)
-                self.set_msg(f"Etiqueta enviada para Zebra IP {ip}:{port}")
+                self.add_log(msg)
             else:
                 self.set_msg(f"ZPL salvo: {zpl_path.name}")
+                self.add_log(f"ZPL salvo: {zpl_path}")
         except Exception as e:
-            self.set_msg(f"Falha na impressão. ZPL salvo. Erro: {e}")
-            self.add_log(f"Erro impressão: {e}")
+            # Nunca perde a etiqueta: se o USB falhar, o ZPL fica salvo.
+            self.set_msg(f"Falha USB. ZPL salvo. Erro: {e}")
+            self.add_log(f"Erro impressão USB: {e}. ZPL salvo em {zpl_path}")
 
     # -----------------------------------------------------
     # REFRESH
