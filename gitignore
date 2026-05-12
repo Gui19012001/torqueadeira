@@ -1,0 +1,19 @@
+teste.env
+.buildozer/
+bin/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# ambiente virtual
+venv/
+.env/
+
+# arquivos gerados localmente
+checklists/
+*.pdf
+*.jpg
+*.jpeg
+*.png
