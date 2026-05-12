@@ -7,9 +7,9 @@ source.dir = .
 source.include_exts = py,kv,png,jpg,jpeg,json,txt,env,zpl,xml
 source.exclude_dirs = .git,.github,__pycache__,bin,.buildozer,venv
 
-version = 0.1.6
+version = 0.2.0
 
-requirements = python3,kivy,pyjnius
+requirements = python3,kivy
 
 orientation = landscape
 fullscreen = 0
