@@ -1,77 +1,815 @@
 # main.py
-# APK Kivy - Controle de Torque PF6000 + Impressao Zebra USB/IP
-# Projeto leve para tablet industrial.
-#
-# Fluxo:
-#   Ethernet tablet -> PF6000 169.254.1.1:4545
-#   APK captura P1..P8 via Open Protocol
-#   USB/OTG tablet -> Zebra USB com ZPL direto
-#   Opcional: Zebra por IP porta 9100
-#
-# Buildozer:
-#   requirements = python3,kivy,pyjnius
+# Torque PF6000 - APK Kivy limpo
+# Versão estável inicial: PF6000 via Ethernet + geração de ZPL SALVAR/IP.
+# USB Zebra fica para segunda etapa, depois que o APK abrir e comunicar estável.
 
-import csv
-import hashlib
 import os
-import queue
-import re
 import socket
 import threading
+import queue
 import time
-from dataclasses import dataclass
-from datetime import datetime
+import hashlib
+import csv
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime
+from typing import Dict, Any, Optional, List, Tuple
 
 from kivy.app import App
-from kivy.clock import Clock, mainthread
-from kivy.core.window import Window
+from kivy.clock import Clock
 from kivy.metrics import dp
-from kivy.properties import StringProperty, BooleanProperty, NumericProperty
+from kivy.core.window import Window
+from kivy.graphics import Color, RoundedRectangle
 from kivy.uix.boxlayout import BoxLayout
-from kivy.uix.button import Button
-from kivy.uix.checkbox import CheckBox
 from kivy.uix.gridlayout import GridLayout
+from kivy.uix.anchorlayout import AnchorLayout
 from kivy.uix.label import Label
+from kivy.uix.button import Button
+from kivy.uix.textinput import TextInput
+from kivy.uix.spinner import Spinner
+from kivy.uix.checkbox import CheckBox
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
-from kivy.uix.spinner import Spinner
-from kivy.uix.textinput import TextInput
-from kivy.utils import platform
-
-# Não importo android.storage na abertura.
-# Em alguns builds isso fecha o APK antes da tela abrir se a recipe "android" não estiver embutida.
-app_storage_path = None
 
 
 # =========================================================
-# CONFIG
+# CONFIG PADRÃO
 # =========================================================
 DEFAULT_IP = "169.254.1.1"
 DEFAULT_PORT = 4545
 POSICOES = [f"P{i}" for i in range(1, 9)]
-DUPLICATE_FRAME_WINDOW_SEC = 20
-AUTO_RESET_AFTER_SEC = 3.0
 
-# Tamanho visual pensado para tablet em landscape.
-Window.clearcolor = (0.035, 0.045, 0.065, 1)
+try:
+    BASE_DIR = Path(os.environ.get("ANDROID_PRIVATE") or os.environ.get("ANDROID_ARGUMENT") or ".")
+except Exception:
+    BASE_DIR = Path(".")
+
+LOG_DIR = BASE_DIR / "logs_torque_pf6000"
+CSV_DIR = BASE_DIR / "registros_torque"
+
+
+def safe_mkdirs():
+    for p in (BASE_DIR, LOG_DIR, CSV_DIR):
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
 
 # =========================================================
-# PATHS
+# FUNÇÕES GERAIS
 # =========================================================
-# IMPORTANTE:
-# Não crie pasta em /sdcard ou em Path.cwd() na importação do app.
-# No Android isso pode fechar o APK antes da primeira tela.
-BASE_DIR = Path(".")
-LOG_DIR = Path(".")
-CSV_DIR = Path(".")
+def now_br() -> str:
+    return datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
 
-def inicializar_pastas(app=None):
-    """Inicializa pastas somente depois que o Kivy App já abriu."""
-    global BASE_DIR, LOG_DIR, CSV_DIR
+def now_file() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def fmt_num(v: Optional[float]) -> str:
+    if v is None:
+        return ""
+    try:
+        return f"{float(v):.2f}".replace(".", ",")
+    except Exception:
+        return ""
+
+
+def status_01(v: Any) -> str:
+    s = str(v or "").strip().upper()
+    if s in ("1", "01", "OK"):
+        return "OK"
+    if s in ("0", "00", "NOK"):
+        return "NOK"
+    return s
+
+
+def scaled_number(raw: str, divisor: float) -> Optional[float]:
+    s = str(raw or "").strip().replace(" ", "")
+    if not s:
+        return None
+    if not s.lstrip("-").isdigit():
+        return None
+    try:
+        return int(s) / float(divisor)
+    except Exception:
+        return None
+
+
+# =========================================================
+# OPEN PROTOCOL
+# =========================================================
+def montar_mid(mid: str, revision: str = "001", data: str = "") -> bytes:
+    mid = str(mid).zfill(4)
+    revision = str(revision).zfill(3)
+    corpo_sem_tamanho = f"{mid}{revision}".ljust(16) + data
+    tamanho = len(corpo_sem_tamanho) + 4
+    return f"{tamanho:04d}{corpo_sem_tamanho}\x00".encode("ascii", errors="ignore")
+
+
+def extrair_mid(frame: str) -> str:
+    if len(frame) >= 8 and frame[:4].isdigit():
+        return frame[4:8]
+    return ""
+
+
+def extrair_rev(frame: str) -> str:
+    if len(frame) >= 11 and frame[8:11].isdigit():
+        return frame[8:11]
+    return "001"
+
+
+def split_frames(buffer: bytes):
+    parts = buffer.split(b"\x00")
+    return parts[:-1], parts[-1]
+
+
+# =========================================================
+# PARSER MID 0061
+# =========================================================
+SPEC_REV1: List[Tuple[str, int, str]] = [
+    ("01", 4, "cell_id"),
+    ("02", 2, "channel_id"),
+    ("03", 25, "controller_name"),
+    ("04", 25, "vin"),
+    ("05", 2, "job_id"),
+    ("06", 3, "pset"),
+    ("07", 4, "batch_size"),
+    ("08", 4, "batch_counter"),
+    ("09", 1, "tightening_status"),
+    ("10", 1, "torque_status"),
+    ("11", 1, "angle_status"),
+    ("12", 6, "torque_min"),
+    ("13", 6, "torque_max"),
+    ("14", 6, "torque_target"),
+    ("15", 6, "torque"),
+    ("16", 5, "angle_min"),
+    ("17", 5, "angle_max"),
+    ("18", 5, "angle_target"),
+    ("19", 5, "angle"),
+    ("20", 19, "timestamp"),
+    ("21", 19, "pset_last_change"),
+    ("22", 1, "batch_status"),
+    ("23", 10, "tightening_id"),
+]
+
+SPEC_REV2: List[Tuple[str, int, str]] = [
+    ("01", 4, "cell_id"),
+    ("02", 2, "channel_id"),
+    ("03", 25, "controller_name"),
+    ("04", 25, "vin"),
+    ("05", 4, "job_id"),
+    ("06", 3, "pset"),
+    ("07", 2, "strategy"),
+    ("08", 5, "strategy_options"),
+    ("09", 4, "batch_size"),
+    ("10", 4, "batch_counter"),
+    ("11", 1, "tightening_status"),
+    ("12", 1, "batch_status"),
+    ("13", 1, "torque_status"),
+    ("14", 1, "angle_status"),
+    ("15", 1, "rundown_angle_status"),
+    ("16", 1, "current_monitoring_status"),
+    ("17", 1, "selftap_status"),
+    ("18", 1, "prevail_torque_monitoring_status"),
+    ("19", 1, "prevail_torque_comp_status"),
+    ("20", 10, "tightening_error_status"),
+    ("21", 6, "torque_min"),
+    ("22", 6, "torque_max"),
+    ("23", 6, "torque_target"),
+    ("24", 6, "torque"),
+    ("25", 5, "angle_min"),
+    ("26", 5, "angle_max"),
+    ("27", 5, "angle_target"),
+    ("28", 5, "angle"),
+    ("29", 5, "rundown_angle_min"),
+    ("30", 5, "rundown_angle_max"),
+    ("31", 5, "rundown_angle"),
+    ("32", 3, "current_monitoring_min"),
+    ("33", 3, "current_monitoring_max"),
+    ("34", 3, "current_monitoring_value"),
+    ("35", 6, "selftap_min"),
+    ("36", 6, "selftap_max"),
+    ("37", 6, "selftap_torque"),
+    ("38", 6, "pvt_min"),
+    ("39", 6, "pvt_max"),
+    ("40", 6, "pvt_torque"),
+    ("41", 10, "tightening_id"),
+    ("42", 5, "job_sequence_number"),
+    ("43", 5, "sync_tightening_id"),
+    ("44", 14, "tool_serial"),
+    ("45", 19, "timestamp"),
+    ("46", 19, "pset_last_change"),
+]
+
+
+def parse_by_spec(frame: str, spec: List[Tuple[str, int, str]], start_pos: int = 20):
+    fields_id: Dict[str, str] = {}
+    fields_name: Dict[str, str] = {}
+    pos = start_pos
+
+    for fid, width, name in spec:
+        if pos >= len(frame):
+            break
+
+        if frame[pos:pos + 2] == fid:
+            id_pos = pos
+        else:
+            found = frame.find(fid, pos, min(len(frame), pos + 12))
+            if found < 0:
+                continue
+            id_pos = found
+
+        ini = id_pos + 2
+        fim = ini + width
+        value = frame[ini:fim]
+        fields_id[fid] = value
+        fields_name[name] = value
+        pos = fim
+
+    return fields_id, fields_name
+
+
+def parse_mid0061(frame: str, torque_divisor: float = 100.0, angle_divisor: float = 1.0):
+    revision = extrair_rev(frame)
+
+    if revision == "001":
+        spec = SPEC_REV1
+        torque_field = "15"
+        angle_field = "19"
+        status_field = "09"
+        torque_status_field = "10"
+        angle_status_field = "11"
+        tightening_id_field = "23"
+    else:
+        spec = SPEC_REV2
+        torque_field = "24"
+        angle_field = "28"
+        status_field = "11"
+        torque_status_field = "13"
+        angle_status_field = "14"
+        tightening_id_field = "41"
+
+    fields_id, fields_name = parse_by_spec(frame, spec)
+
+    raw_torque = (fields_id.get(torque_field, "") or "").strip()
+    raw_angle = (fields_id.get(angle_field, "") or "").strip()
+
+    tid = (fields_id.get(tightening_id_field, "") or fields_name.get("tightening_id", "") or "").strip()
+    frame_hash = hashlib.sha1(frame.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+    pset = (fields_name.get("pset", "") or "").strip()
+    pset = pset.lstrip("0") or pset
+
+    return {
+        "frame": frame,
+        "frame_hash": frame_hash,
+        "revision": revision,
+        "tightening_id": tid,
+        "status_geral": status_01(fields_id.get(status_field, "")),
+        "status_torque": status_01(fields_id.get(torque_status_field, "")),
+        "status_angulo": status_01(fields_id.get(angle_status_field, "")),
+        "torque": scaled_number(raw_torque, torque_divisor),
+        "angulo": scaled_number(raw_angle, angle_divisor),
+        "torque_raw": raw_torque,
+        "angulo_raw": raw_angle,
+        "pset": pset,
+    }
+
+
+# =========================================================
+# CLIENTE PF6000
+# =========================================================
+class PF6000Client:
+    def __init__(self, event_q: queue.Queue):
+        self.q = event_q
+        self.sock = None
+        self.thread = None
+        self.stop_flag = threading.Event()
+        self.connected = False
+        self.open_ok = False
+        self.last_mid = "-"
+        self.ip = DEFAULT_IP
+        self.port = DEFAULT_PORT
+
+    def emit(self, kind: str, data: Any = None):
+        self.q.put((kind, data))
+
+    def log(self, msg: str):
+        self.emit("log", f"[{now_br()}] {msg}")
+        try:
+            safe_mkdirs()
+            with (LOG_DIR / f"pf6000_{datetime.now().strftime('%Y%m%d')}.log").open("a", encoding="utf-8") as f:
+                f.write(f"[{now_br()}] {msg}\n")
+        except Exception:
+            pass
+
+    def snapshot(self):
+        return {
+            "connected": self.connected,
+            "open_ok": self.open_ok,
+            "last_mid": self.last_mid,
+        }
+
+    def connect(self, ip: str, port: int):
+        self.disconnect()
+        self.ip = ip
+        self.port = int(port)
+        self.stop_flag.clear()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def disconnect(self):
+        self.stop_flag.set()
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+        self.connected = False
+        self.open_ok = False
+        self.emit("status", self.snapshot())
+
+    def send_mid(self, mid: str, rev: str = "001"):
+        try:
+            if self.sock:
+                self.sock.sendall(montar_mid(mid, rev))
+                self.log(f"ENVIADO MID {mid} REV {rev}")
+        except Exception as e:
+            self.log(f"Erro enviando MID {mid}: {e}")
+
+    def _loop(self):
+        while not self.stop_flag.is_set():
+            try:
+                self.log(f"Conectando {self.ip}:{self.port}")
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(4)
+                s.connect((self.ip, self.port))
+                s.settimeout(1)
+                self.sock = s
+                self.connected = True
+                self.open_ok = False
+                self.emit("status", self.snapshot())
+
+                self.send_mid("0001", "006")
+                self._reader(s)
+
+            except Exception as e:
+                self.connected = False
+                self.open_ok = False
+                self.emit("status", self.snapshot())
+                self.log(f"Conexão falhou/caiu: {e}")
+                time.sleep(2)
+
+    def _reader(self, s):
+        buffer = b""
+        last_keepalive = time.time()
+
+        while not self.stop_flag.is_set():
+            try:
+                if time.time() - last_keepalive >= 10:
+                    self.send_mid("9999", "001")
+                    last_keepalive = time.time()
+
+                data = s.recv(4096)
+                if not data:
+                    raise RuntimeError("painel encerrou conexão")
+
+                raw = buffer + data
+                frames, buffer = split_frames(raw)
+
+                for fb in frames:
+                    frame = fb.decode("ascii", errors="ignore")
+                    mid = extrair_mid(frame)
+                    self.last_mid = mid
+                    self.emit("status", self.snapshot())
+                    self.log(f"RECEBIDO MID {mid}")
+
+                    if mid == "0002":
+                        self.open_ok = True
+                        self.emit("status", self.snapshot())
+                        self.send_mid("0060", "001")
+
+                    elif mid == "0061":
+                        self.send_mid("0062", "001")
+                        self.emit("frame", frame)
+
+                    elif mid == "9999":
+                        self.send_mid("9999", "001")
+
+            except socket.timeout:
+                continue
+            except Exception as e:
+                self.log(f"Leitura encerrada: {e}")
+                break
+
+        self.connected = False
+        self.open_ok = False
+        self.emit("status", self.snapshot())
+
+
+# =========================================================
+# CARD VISUAL
+# =========================================================
+class PCard(BoxLayout):
+    def __init__(self, ponto: str, callback, **kwargs):
+        super().__init__(orientation="vertical", padding=dp(8), spacing=dp(4), **kwargs)
+        self.ponto = ponto
+        self.callback = callback
+        self.status = "AGUARDANDO"
+        self.bg_color = (0.08, 0.09, 0.10, 1)
+        self.border_color = (0.25, 0.25, 0.25, 1)
+
+        with self.canvas.before:
+            self.c_bg = Color(*self.bg_color)
+            self.rect = RoundedRectangle(pos=self.pos, size=self.size, radius=[dp(10)])
+        self.bind(pos=self._upd, size=self._upd)
+
+        self.lbl_p = Label(text=ponto, font_size="24sp", bold=True, color=(1, 1, 1, 1), size_hint_y=0.23)
+        self.lbl_status = Label(text="AGUARDANDO", font_size="13sp", bold=True, color=(0.8, 0.8, 0.8, 1), size_hint_y=0.18)
+        self.lbl_torque = Label(text="Torque:", font_size="13sp", color=(1, 1, 1, 1), size_hint_y=0.18)
+        self.lbl_angulo = Label(text="Ângulo:", font_size="13sp", color=(1, 1, 1, 1), size_hint_y=0.18)
+        self.lbl_info = Label(text="Tent: 0 | NOK: 0", font_size="11sp", color=(0.8, 0.8, 0.8, 1), size_hint_y=0.13)
+
+        btn = Button(text=f"Selecionar {ponto}", font_size="12sp", size_hint_y=0.22)
+        btn.bind(on_release=lambda *_: self.callback(self.ponto))
+
+        self.add_widget(self.lbl_p)
+        self.add_widget(self.lbl_status)
+        self.add_widget(self.lbl_torque)
+        self.add_widget(self.lbl_angulo)
+        self.add_widget(self.lbl_info)
+        self.add_widget(btn)
+
+    def _upd(self, *_):
+        self.rect.pos = self.pos
+        self.rect.size = self.size
+
+    def set_data(self, data: Dict[str, Any], current: bool):
+        status = data.get("status", "AGUARDANDO")
+        torque = fmt_num(data.get("torque"))
+        angulo = fmt_num(data.get("angulo"))
+        tent = data.get("tentativas", 0)
+        nok = data.get("nok", 0)
+
+        if current:
+            self.bg_color = (0.02, 0.13, 0.24, 1)
+            status_color = (0.0, 0.85, 1.0, 1)
+        elif status == "OK":
+            self.bg_color = (0.02, 0.18, 0.08, 1)
+            status_color = (0.0, 0.95, 0.45, 1)
+        elif status == "RETESTE":
+            self.bg_color = (0.25, 0.18, 0.00, 1)
+            status_color = (1.0, 0.86, 0.0, 1)
+        else:
+            self.bg_color = (0.08, 0.09, 0.10, 1)
+            status_color = (0.8, 0.8, 0.8, 1)
+
+        self.c_bg.rgba = self.bg_color
+        self.lbl_status.text = status
+        self.lbl_status.color = status_color
+        self.lbl_torque.text = f"Torque: {torque}"
+        self.lbl_angulo.text = f"Ângulo: {angulo}"
+        self.lbl_info.text = f"Tent: {tent} | NOK: {nok}"
+
+
+# =========================================================
+# APP
+# =========================================================
+class TorqueApp(App):
+    def build(self):
+        safe_mkdirs()
+        Window.clearcolor = (0.04, 0.05, 0.07, 1)
+
+        self.q = queue.Queue()
+        self.client = PF6000Client(self.q)
+
+        self.current_idx = 0
+        self.processed_ids = set()
+        self.processed_hashes = set()
+        self.cards: Dict[str, PCard] = {}
+        self.data = {
+            p: {"status": "AGUARDANDO", "torque": None, "angulo": None, "tentativas": 0, "nok": 0, "tid": ""}
+            for p in POSICOES
+        }
+
+        self.serie = ""
+        self.op = ""
+
+        root = BoxLayout(orientation="vertical", padding=dp(8), spacing=dp(6))
+
+        header = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(48), spacing=dp(6))
+        title = Label(text="Torque Mola - PF6000", font_size="20sp", bold=True, color=(1, 1, 1, 1))
+        btn_cfg = Button(text="CONFIG", size_hint_x=None, width=dp(120))
+        btn_cfg.bind(on_release=self.open_config)
+        header.add_widget(title)
+        header.add_widget(btn_cfg)
+        root.add_widget(header)
+
+        inputs = BoxLayout(orientation="horizontal", size_hint_y=None, height=dp(44), spacing=dp(6))
+        self.in_serie = TextInput(hint_text="Numero de serie", multiline=False, font_size="16sp")
+        self.in_op = TextInput(hint_text="OP", multiline=False, font_size="16sp")
+        inputs.add_widget(self.in_serie)
+        inputs.add_widget(self.in_op)
+        root.add_widget(inputs)
+
+        statusbar = GridLayout(cols=5, size_hint_y=None, height=dp(56), spacing=dp(6))
+        self.lbl_tcp = self.metric("TCP", "OFF")
+        self.lbl_open = self.metric("OPEN", "OFF")
+        self.lbl_mid = self.metric("MID", "-")
+        self.lbl_pos = self.metric("POS", "P1")
+        self.lbl_result = self.metric("GERAL", "PENDENTE")
+        for w in (self.lbl_tcp, self.lbl_open, self.lbl_mid, self.lbl_pos, self.lbl_result):
+            statusbar.add_widget(w)
+        root.add_widget(statusbar)
+
+        self.msg = Label(text="Aguardando.", size_hint_y=None, height=dp(34), color=(1, 0.9, 0.5, 1), font_size="13sp")
+        root.add_widget(self.msg)
+
+        grid = GridLayout(cols=4, spacing=dp(8))
+        for p in POSICOES:
+            card = PCard(p, self.select_pos)
+            self.cards[p] = card
+            grid.add_widget(card)
+        root.add_widget(grid)
+
+        buttons = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6))
+        b1 = Button(text="Conectar PF6000")
+        b1.bind(on_release=lambda *_: self.connect_pf())
+        b2 = Button(text="Desconectar")
+        b2.bind(on_release=lambda *_: self.client.disconnect())
+        b3 = Button(text="Reset ciclo")
+        b3.bind(on_release=lambda *_: self.reset_cycle())
+        b4 = Button(text="Salvar ZPL")
+        b4.bind(on_release=lambda *_: self.save_zpl())
+        for b in (b1, b2, b3, b4):
+            buttons.add_widget(b)
+        root.add_widget(buttons)
+
+        self.cfg_ip = DEFAULT_IP
+        self.cfg_port = str(DEFAULT_PORT)
+        self.cfg_print_mode = "SALVAR"
+        self.cfg_zebra_ip = "192.168.0.50"
+        self.cfg_zebra_port = "9100"
+
+        Clock.schedule_interval(self.poll_events, 0.1)
+        self.refresh_cards()
+        return root
+
+    def metric(self, name: str, value: str):
+        box = BoxLayout(orientation="vertical", padding=dp(4))
+        box.add_widget(Label(text=name, font_size="10sp", color=(0.65, 0.7, 0.78, 1), size_hint_y=0.4))
+        box.val = Label(text=value, font_size="17sp", bold=True, color=(1, 1, 1, 1), size_hint_y=0.6)
+        box.add_widget(box.val)
+        return box
+
+    def set_metric(self, box, value: str):
+        box.val.text = str(value)
+
+    def open_config(self, *_):
+        layout = BoxLayout(orientation="vertical", padding=dp(12), spacing=dp(8))
+
+        ip = TextInput(text=self.cfg_ip, hint_text="IP PF6000", multiline=False)
+        port = TextInput(text=self.cfg_port, hint_text="Porta PF6000", multiline=False)
+        mode = Spinner(text=self.cfg_print_mode, values=["SALVAR", "IP"], size_hint_y=None, height=dp(44))
+        zebra_ip = TextInput(text=self.cfg_zebra_ip, hint_text="IP Zebra", multiline=False)
+        zebra_port = TextInput(text=self.cfg_zebra_port, hint_text="Porta Zebra", multiline=False)
+
+        for lbl, widget in [
+            ("IP PF6000", ip),
+            ("Porta PF6000", port),
+            ("Modo impressao", mode),
+            ("IP Zebra", zebra_ip),
+            ("Porta Zebra", zebra_port),
+        ]:
+            layout.add_widget(Label(text=lbl, size_hint_y=None, height=dp(22), color=(1, 1, 1, 1)))
+            layout.add_widget(widget)
+
+        actions = BoxLayout(size_hint_y=None, height=dp(48), spacing=dp(6))
+        pop = Popup(title="Configuracoes", content=layout, size_hint=(0.9, 0.9))
+
+        def salvar(*_):
+            self.cfg_ip = ip.text.strip() or DEFAULT_IP
+            self.cfg_port = port.text.strip() or str(DEFAULT_PORT)
+            self.cfg_print_mode = mode.text
+            self.cfg_zebra_ip = zebra_ip.text.strip()
+            self.cfg_zebra_port = zebra_port.text.strip() or "9100"
+            pop.dismiss()
+
+        btn_ok = Button(text="Salvar")
+        btn_ok.bind(on_release=salvar)
+        btn_cancel = Button(text="Cancelar")
+        btn_cancel.bind(on_release=lambda *_: pop.dismiss())
+        actions.add_widget(btn_ok)
+        actions.add_widget(btn_cancel)
+        layout.add_widget(actions)
+        pop.open()
+
+    def connect_pf(self):
+        try:
+            port = int(self.cfg_port)
+        except Exception:
+            port = DEFAULT_PORT
+        self.client.connect(self.cfg_ip, port)
+
+    def select_pos(self, p: str):
+        if p in POSICOES:
+            self.current_idx = POSICOES.index(p)
+            self.msg.text = f"Selecionado {p}"
+            self.refresh_cards()
+
+    def poll_events(self, dt):
+        while True:
+            try:
+                kind, data = self.q.get_nowait()
+            except queue.Empty:
+                break
+
+            if kind == "status":
+                self.set_metric(self.lbl_tcp, "ON" if data.get("connected") else "OFF")
+                self.set_metric(self.lbl_open, "OK" if data.get("open_ok") else "OFF")
+                self.set_metric(self.lbl_mid, data.get("last_mid", "-"))
+
+            elif kind == "log":
+                # Mantém só última mensagem na tela para não pesar.
+                self.msg.text = str(data)[-140:]
+
+            elif kind == "frame":
+                self.handle_frame(data)
+
+    def is_duplicate(self, parsed: Dict[str, Any]):
+        tid = parsed.get("tightening_id") or ""
+        fh = parsed.get("frame_hash") or ""
+        if tid and tid in self.processed_ids:
+            return True
+        if fh and fh in self.processed_hashes:
+            return True
+        if tid:
+            self.processed_ids.add(tid)
+        if fh:
+            self.processed_hashes.add(fh)
+        return False
+
+    def handle_frame(self, frame: str):
+        parsed = parse_mid0061(frame)
+
+        if self.is_duplicate(parsed):
+            self.msg.text = "Resultado duplicado ignorado."
+            return
+
+        p = POSICOES[self.current_idx]
+        item = self.data[p]
+        item["tentativas"] += 1
+        item["torque"] = parsed.get("torque")
+        item["angulo"] = parsed.get("angulo")
+        item["tid"] = parsed.get("tightening_id") or ""
+
+        status = parsed.get("status_geral") or "SEM LEITURA"
+
+        if status == "OK":
+            item["status"] = "OK"
+            self.save_attempt(p, status, parsed)
+            if self.current_idx < len(POSICOES) - 1:
+                self.current_idx += 1
+                self.msg.text = f"{p} OK. Avancou para {POSICOES[self.current_idx]}."
+            else:
+                self.msg.text = "P8 OK. Ciclo finalizado."
+                self.save_cycle_csv()
+                self.save_zpl()
+                Clock.schedule_once(lambda *_: self.reset_cycle(), 3)
+
+        elif status == "NOK":
+            item["status"] = "RETESTE"
+            item["nok"] += 1
+            self.save_attempt(p, status, parsed)
+            self.msg.text = f"{p} NOK. Torque salvo. Refaca o ponto."
+
+        else:
+            item["status"] = "RETESTE"
+            self.save_attempt(p, status, parsed)
+            self.msg.text = f"{p}: leitura incompleta. Refaca."
+
+        self.refresh_cards()
+
+    def refresh_cards(self):
+        for i, p in enumerate(POSICOES):
+            self.cards[p].set_data(self.data[p], i == self.current_idx)
+        self.set_metric(self.lbl_pos, POSICOES[self.current_idx])
+        geral = "OK" if all(self.data[p]["status"] == "OK" for p in POSICOES) else "PENDENTE"
+        if any(self.data[p]["status"] == "RETESTE" for p in POSICOES):
+            geral = "RETESTE"
+        self.set_metric(self.lbl_result, geral)
+
+    def reset_cycle(self):
+        self.current_idx = 0
+        self.data = {
+            p: {"status": "AGUARDANDO", "torque": None, "angulo": None, "tentativas": 0, "nok": 0, "tid": ""}
+            for p in POSICOES
+        }
+        self.msg.text = "Novo ciclo. Aguardando P1."
+        self.refresh_cards()
+
+    def save_attempt(self, p: str, status: str, parsed: Dict[str, Any]):
+        try:
+            safe_mkdirs()
+            serie = (self.in_serie.text or "SEM_SERIE").replace("/", "_").replace("\\", "_")
+            arq = CSV_DIR / f"tentativas_{serie}_{datetime.now().strftime('%Y%m%d')}.csv"
+            exists = arq.exists()
+            with arq.open("a", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f, delimiter=";")
+                if not exists:
+                    w.writerow(["data_hora", "serie", "op", "posicao", "status", "torque", "angulo", "pset", "tid", "rev"])
+                w.writerow([
+                    now_br(),
+                    self.in_serie.text,
+                    self.in_op.text,
+                    p,
+                    status,
+                    parsed.get("torque"),
+                    parsed.get("angulo"),
+                    parsed.get("pset"),
+                    parsed.get("tightening_id"),
+                    parsed.get("revision"),
+                ])
+        except Exception as e:
+            self.msg.text = f"Erro CSV: {e}"
+
+    def save_cycle_csv(self):
+        try:
+            safe_mkdirs()
+            serie = (self.in_serie.text or "SEM_SERIE").replace("/", "_").replace("\\", "_")
+            arq = CSV_DIR / f"ciclo_{serie}_{now_file()}.csv"
+            with arq.open("w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f, delimiter=";")
+                w.writerow(["serie", self.in_serie.text, "op", self.in_op.text, "data", now_br()])
+                w.writerow(["posicao", "status", "torque", "angulo", "tentativas", "nok"])
+                for p in POSICOES:
+                    d = self.data[p]
+                    w.writerow([p, d["status"], d["torque"], d["angulo"], d["tentativas"], d["nok"]])
+        except Exception as e:
+            self.msg.text = f"Erro ciclo CSV: {e}"
+
+    def gerar_zpl(self) -> str:
+        data_hora = now_br()
+        serie = self.in_serie.text or ""
+        linhas = []
+        for p in POSICOES:
+            d = self.data[p]
+            st = "OK" if d["status"] == "OK" else ("NOK" if d["nok"] > 0 else d["status"])
+            tq = fmt_num(d["torque"])
+            linhas.append(f"{p}: {tq}-{st}")
+
+        return f"""^XA
+^CI28
+^PW899
+^LL399
+^LH0,0
+^CF0,18
+^FO175,35^A0N,30,30^FB560,1,0,C,0^FDREGISTRO DE TORQUE^FS
+^FO30,95^A0N,25,25^FDDATA/HORA: {data_hora}^FS
+^FO30,130^A0N,25,25^FDSERIE: {serie}^FS
+^FO10,170^GB850,2,2^FS
+^FO35,200^A0N,28,28^FD{linhas[0]}^FS
+^FO35,245^A0N,28,28^FD{linhas[1]}^FS
+^FO35,290^A0N,28,28^FD{linhas[2]}^FS
+^FO35,335^A0N,28,28^FD{linhas[3]}^FS
+^FO460,200^A0N,28,28^FD{linhas[4]}^FS
+^FO460,245^A0N,28,28^FD{linhas[5]}^FS
+^FO460,290^A0N,28,28^FD{linhas[6]}^FS
+^FO460,335^A0N,28,28^FD{linhas[7]}^FS
+^PQ1,0,1,N
+^XZ"""
+
+    def save_zpl(self):
+        zpl = self.gerar_zpl()
+        try:
+            safe_mkdirs()
+            serie = (self.in_serie.text or "SEM_SERIE").replace("/", "_").replace("\\", "_")
+            arq = CSV_DIR / f"etiqueta_{serie}_{now_file()}.zpl"
+            arq.write_text(zpl, encoding="utf-8")
+            self.msg.text = f"ZPL salvo: {arq.name}"
+        except Exception as e:
+            self.msg.text = f"Erro salvando ZPL: {e}"
+
+        if self.cfg_print_mode == "IP":
+            self.print_ip(zpl)
+
+    def print_ip(self, zpl: str):
+        try:
+            port = int(self.cfg_zebra_port)
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5)
+            s.connect((self.cfg_zebra_ip, port))
+            s.sendall(zpl.encode("utf-8"))
+            s.close()
+            self.msg.text = "Etiqueta enviada por IP."
+        except Exception as e:
+            self.msg.text = f"Falha impressao IP: {e}"
+
+
+if __name__ == "__main__":
+    TorqueApp().run()
 
     candidatos = []
 
